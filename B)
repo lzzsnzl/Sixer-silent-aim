@@ -1,0 +1,403 @@
+local env = (typeof(getgenv) == "function" and getgenv()) or _G
+if type(env.__G666_PURSUIT_UNLOAD) == "function" then pcall(env.__G666_PURSUIT_UNLOAD) end
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local Workspace = game:GetService("Workspace")
+local Stats = game:GetService("Stats")
+
+local LocalPlayer = Players.LocalPlayer
+if not LocalPlayer then return end
+
+local PRE_STEP, POST_STEP = "__G666_P_PRE", "__G666_P_POST"
+
+local CFG = {
+	StraightMaxDist = 52,
+	MaxMissStuds = 12,
+	LowHPWeight = 50,
+	AimOffset = -0.2,
+	BaseDelay = 0.055,
+	PingFactor = 0.85,
+
+	Speed = 9,
+	BaseSpeed = 7,
+	MaxSpeed = 17,
+	GravityMult = 0.6,
+	MinAngle = 20,
+	HorizPenalty = 0.8,
+	Length = 0.8,
+	HoldMin = 0.75,
+	HoldMax = 1.25,
+
+	Predict = {
+		VelBlend = 0.62,
+		MoveDirBlend = 0.28,
+		Stationary = 1.2,
+		WalkThreshold = 17.5,
+		Walk = { LeadMult = 1.04, Extra = 0.02, Smooth = 0.70, MinConf = 0.65 },
+		Sprint = { LeadMult = 1.00, Extra = 0.015, Smooth = 0.58, MinConf = 0.45 },
+		AccelSmooth = 0.25,
+		AccelClamp = 85,
+		AccelWeight = 0.14,
+		JukeDot = 0.10,
+		ConfRec = 5.5,
+		CurveWeight = 0.50,
+		MaxYaw = 3.0,
+		MaxCurve = 0.52,
+		MaxLead = 1.9,
+		SpeedCap = 36,
+	},
+}
+
+local wallParams = RaycastParams.new()
+wallParams.FilterType = Enum.RaycastFilterType.Exclude
+wallParams.CollisionGroup = "Killers"
+wallParams.RespectCanCollide = true
+wallParams.IgnoreWater = true
+
+local motion = setmetatable({}, { __mode = "k" })
+local cachedPing, lastPingAt = 0.05, 0
+local lastFilterRef, lockedRoot, lockedHum, savedCamCF
+local wasCharging, chargeStartAt = false, 0
+local hbConn, unloaded = nil, false
+
+local function updateWallFilter()
+	local ref = Workspace:FindFirstChild("Players") or LocalPlayer.Character
+	if ref and ref ~= lastFilterRef then
+		lastFilterRef = ref
+		wallParams.FilterDescendantsInstances = { ref }
+	end
+end
+
+local function getPing()
+	local now = os.clock()
+	if now - lastPingAt >= 0.25 then
+		lastPingAt = now
+		local ok, ms = pcall(function() return Stats.Network.ServerStatsItem["Data Ping"]:GetValue() end)
+		if ok and type(ms) == "number" and ms == ms then
+			cachedPing = math.clamp((ms / 1000) * CFG.PingFactor, 0.03, 0.35)
+		else
+			local ok2, sec = pcall(function() return LocalPlayer:GetNetworkPing() end)
+			if ok2 and type(sec) == "number" and sec == sec then
+				cachedPing = math.clamp(sec * CFG.PingFactor, 0.03, 0.35)
+			end
+		end
+	end
+	return cachedPing
+end
+
+local function eachSurvivor(char, visit)
+	local pf = Workspace:FindFirstChild("Players")
+	local folder = pf and pf:FindFirstChild("Survivors")
+	if not folder then return end
+	for _, model in ipairs(folder:GetChildren()) do
+		if model ~= char and model:IsA("Model") then
+			local root = model:FindFirstChild("HumanoidRootPart") or model.PrimaryPart
+			local hum = model:FindFirstChildOfClass("Humanoid")
+			if root and hum and hum.Health > 0 then visit(root, hum) end
+		end
+	end
+end
+
+local function sampleTarget(root, hum)
+	local pos, now = root.Position, os.clock()
+	local st = hum:GetState()
+	local airborne = st == Enum.HumanoidStateType.Freefall or st == Enum.HumanoidStateType.Jumping
+	local asmVel = root.AssemblyLinearVelocity
+	local d = motion[root]
+
+	if not d then
+		motion[root] = { pos = pos, time = now, vel = asmVel, lastVel = asmVel, accel = Vector3.zero, yaw = 0, conf = 1, airborne = airborne, walk = false }
+		return
+	end
+
+	local dt = now - d.time
+	if dt < 0.015 then return end
+
+	local P = CFG.Predict
+	local rawVel = ((pos - d.pos) / dt):Lerp(asmVel, 1 - P.VelBlend)
+	local flatRaw = Vector3.new(rawVel.X, 0, rawVel.Z)
+
+	local md = hum.MoveDirection
+	if md.Magnitude > 0.1 then
+		local mf = Vector3.new(md.X, 0, md.Z)
+		if mf.Magnitude > 1e-4 then
+			local desired = math.max(flatRaw.Magnitude, math.min(hum.WalkSpeed, P.SpeedCap))
+			flatRaw = flatRaw:Lerp(mf.Unit * desired, flatRaw.Magnitude < 2 and 0.60 or P.MoveDirBlend)
+			rawVel = Vector3.new(flatRaw.X, rawVel.Y, flatRaw.Z)
+		end
+	end
+
+	local flatMag = flatRaw.Magnitude
+	if flatMag > P.SpeedCap then
+		flatRaw = flatRaw.Unit * P.SpeedCap
+		rawVel = Vector3.new(flatRaw.X, rawVel.Y, flatRaw.Z)
+		flatMag = P.SpeedCap
+	end
+
+	if flatMag < P.Stationary and not airborne then
+		d.vel = d.vel:Lerp(Vector3.zero, 0.75)
+		d.accel, d.yaw = d.accel * 0.2, d.yaw * 0.2
+		d.conf = math.min(1, d.conf + dt * P.ConfRec)
+		d.lastVel, d.pos, d.time, d.airborne, d.walk = d.vel, pos, now, false, false
+		return
+	end
+
+	local isWalk = flatMag <= P.WalkThreshold
+	local prof = isWalk and P.Walk or P.Sprint
+
+	local prevFlat = Vector3.new(d.vel.X, 0, d.vel.Z)
+	if prevFlat.Magnitude > 2 and flatMag > 2 then
+		local pDir, nDir = prevFlat.Unit, flatRaw.Unit
+		local dot = math.clamp(pDir:Dot(nDir), -1, 1)
+		if dot < P.JukeDot then
+			d.conf = math.min(d.conf, math.clamp((dot + 1) * 0.5, prof.MinConf, 1))
+			d.accel, d.yaw = d.accel * 0.25, 0
+		else
+			d.conf = math.min(1, d.conf + dt * P.ConfRec)
+			local yaw = math.clamp(math.atan2(pDir.Z * nDir.X - pDir.X * nDir.Z, dot) / dt, -P.MaxYaw, P.MaxYaw)
+			d.yaw = d.yaw + (yaw - d.yaw) * 0.30
+		end
+	else
+		d.conf = math.min(1, d.conf + dt * P.ConfRec)
+		d.yaw = d.yaw * 0.5
+	end
+
+	d.vel = d.vel:Lerp(rawVel, prof.Smooth)
+	local rawAccel = (d.vel - d.lastVel) / dt
+	if rawAccel.Magnitude > P.AccelClamp then rawAccel = rawAccel.Unit * P.AccelClamp end
+	local w = airborne and 0.15 or P.AccelWeight
+	d.accel = d.accel:Lerp(Vector3.new(rawAccel.X * w, 0, rawAccel.Z * w), P.AccelSmooth)
+	d.lastVel, d.pos, d.time, d.airborne, d.walk = d.vel, pos, now, airborne, isWalk
+end
+
+local function predictPos(root, leadTime)
+	local P = CFG.Predict
+	local d = motion[root]
+	local base = root.Position + Vector3.new(0, CFG.AimOffset, 0)
+	local vel = d and d.vel or root.AssemblyLinearVelocity
+	local accel = d and d.accel or Vector3.zero
+	local conf = d and d.conf or 1
+	local airborne = d and d.airborne or false
+	local yaw = d and d.yaw or 0
+
+	local flatSpeed = Vector3.new(vel.X, 0, vel.Z).Magnitude
+	if flatSpeed < P.Stationary and not airborne then return base end
+
+	local prof = (d and d.walk or flatSpeed <= P.WalkThreshold) and P.Walk or P.Sprint
+	local t = math.clamp((leadTime + prof.Extra) * prof.LeadMult, 0, P.MaxLead)
+	local et = t * conf
+
+	local vx, vz = vel.X, vel.Z
+	if math.abs(yaw) > 0.15 and flatSpeed > 3 and conf > 0.65 then
+		local ang = math.clamp(yaw * et * P.CurveWeight * 0.5, -P.MaxCurve, P.MaxCurve)
+		local c, s = math.cos(ang), math.sin(ang)
+		vx, vz = vx * c + vz * s, -vx * s + vz * c
+	end
+
+	local vy = airborne and (vel.Y * t - 0.5 * Workspace.Gravity * t * t) or (vel.Y * et)
+	local pred = base + Vector3.new(vx * et + 0.5 * accel.X * et * et, vy, vz * et + 0.5 * accel.Z * et * et)
+
+	updateWallFilter()
+	local mv = pred - base
+	if mv.Magnitude > 0.75 then
+		local hit = Workspace:Raycast(base, mv, wallParams)
+		if hit then
+			local stopPos = hit.Position - mv.Unit * 1.15
+			local rem = pred - hit.Position
+			local slide = rem - hit.Normal * rem:Dot(hit.Normal)
+			if slide.Magnitude > 0.35 then
+				local sHit = Workspace:Raycast(stopPos, slide * 0.85, wallParams)
+				pred = sHit and (sHit.Position - slide.Unit * 1.15) or (stopPos + slide * 0.85)
+			else
+				pred = stopPos
+			end
+		end
+	end
+
+	if pred.Y < base.Y - 2.5 then
+		local fl = Workspace:Raycast(Vector3.new(pred.X, base.Y + 1, pred.Z), Vector3.new(0, -60, 0), wallParams)
+		if fl then pred = Vector3.new(pred.X, math.max(pred.Y, fl.Position.Y + 2), pred.Z) end
+	end
+
+	return pred
+end
+
+local function isStraightClear(origin, targetPos)
+	local delta = targetPos - origin
+	local dist = delta.Magnitude
+	if dist < 2.5 then return true end
+	updateWallFilter()
+	for _, yOff in ipairs({ 0.4, -1.0 }) do
+		local o = origin + Vector3.new(0, yOff, 0)
+		local hit = Workspace:Spherecast(o, 1.4, delta, wallParams)
+		if hit and hit.Normal.Y < 0.35 and (hit.Position - o).Magnitude < dist - 2 then
+			return false
+		end
+	end
+	return true
+end
+
+local function simArc(origin, flatDir, vh, vy, g, maxT)
+	updateWallFilter()
+	local prev = origin
+	for t = 0.08, maxT, 0.08 do
+		local nextPos = origin + flatDir * (vh * t) + Vector3.new(0, vy * t - 0.5 * g * t * t, 0)
+		local seg = nextPos - prev
+		if seg.Magnitude > 0.05 then
+			local hit = Workspace:Spherecast(prev, 1.2, seg, wallParams)
+			if hit then return hit.Position, hit.Normal.Y < 0.35 end
+		end
+		prev = nextPos
+	end
+	return prev, false
+end
+
+local function solvePursuit(targetRoot, myRoot, elapsed)
+	local origin = myRoot.Position
+	local g = Workspace.Gravity * CFG.GravityMult
+	local vMax = CFG.MaxSpeed * CFG.Speed
+	local maxRange = (0.625 * vMax * vMax) / math.max(g, 1)
+	local rawDist = (targetRoot.Position - origin).Magnitude
+
+	local ping = getPing() + CFG.BaseDelay
+	local effCharge = math.clamp(math.max(elapsed, CFG.HoldMin), CFG.HoldMin, CFG.HoldMax)
+	local V = (CFG.BaseSpeed + (CFG.MaxSpeed - CFG.BaseSpeed) * (effCharge / CFG.HoldMax)) * CFG.Speed
+
+	local tFlat = math.clamp(rawDist / V, 0, CFG.Length)
+	local predFlat = targetRoot.Position
+	for _ = 1, 3 do
+		predFlat = predictPos(targetRoot, tFlat + ping)
+		tFlat = math.clamp((predFlat - origin).Magnitude / V, 0, CFG.Length)
+	end
+
+	local flatVec = Vector3.new(predFlat.X - origin.X, 0, predFlat.Z - origin.Z)
+	local flatDist = flatVec.Magnitude
+	local fallbackDir = flatDist > 0.05 and flatVec.Unit or myRoot.CFrame.LookVector
+
+	if flatDist <= math.min(CFG.StraightMaxDist, V * CFG.Length + 3) and (predFlat.Y - origin.Y) <= 3.5 and isStraightClear(origin, predFlat) then
+		return fallbackDir, 0, true
+	end
+
+	local minAng = CFG.MinAngle + 0.5
+	local bestAng, bestScore, bestMiss, bestDir = 56.25, math.huge, math.huge, fallbackDir
+
+	local function evalArc(ang)
+		local vy = V * (ang / 90)
+		local vh = V * ((90 - math.min(ang * CFG.HorizPenalty, 80)) / 90)
+		if vh < 1 then return nil end
+		local tAir = math.clamp((2 * vy) / g, 0.25, 3.2)
+		local pred = predictPos(targetRoot, math.min(tAir, 1.8) + ping)
+		local dv = Vector3.new(pred.X - origin.X, 0, pred.Z - origin.Z)
+		if dv.Magnitude < 0.1 then return nil end
+		local dir = dv.Unit
+		local landPos, hitWall = simArc(origin, dir, vh, vy, g, tAir + 0.35)
+		local miss = (landPos - pred).Magnitude
+		return miss + (hitWall and 14 or 0) + ang * 0.03, miss, hitWall, dir
+	end
+
+	for ang = minAng, 78, 3 do
+		local score, miss, hitWall, dir = evalArc(ang)
+		if score and score < bestScore then
+			bestAng, bestScore, bestMiss, bestDir = ang, score, miss, dir
+			if not hitWall and miss < 2.2 then break end
+		end
+	end
+
+	local baseAng = bestAng
+	for delta = -2.5, 2.5, 0.75 do
+		local cand = math.clamp(baseAng + delta, minAng, 78)
+		local score, miss, _, dir = evalArc(cand)
+		if score and score < bestScore then
+			bestAng, bestScore, bestMiss, bestDir = cand, score, miss, dir
+		end
+	end
+
+	local reachable = (rawDist <= maxRange + 14) and (bestMiss <= CFG.MaxMissStuds or elapsed < CFG.HoldMax * 0.9)
+	return bestDir, math.clamp(bestAng / 1.1, minAng / 1.1, 74), reachable
+end
+
+local function pickTarget(char, myRoot, elapsed)
+	local list = {}
+	eachSurvivor(char, function(root, hum)
+		local dist = (root.Position - myRoot.Position).Magnitude
+		local hp = math.clamp(hum.Health / math.max(hum.MaxHealth, 1), 0, 1)
+		list[#list + 1] = { root = root, hum = hum, score = dist + hp * CFG.LowHPWeight }
+	end)
+	if #list == 0 then return nil end
+
+	table.sort(list, function(a, b) return a.score < b.score end)
+
+	local fbRoot, fbHum, fbDir, fbPitch
+	for _, c in ipairs(list) do
+		local dir, pitch, reachable = solvePursuit(c.root, myRoot, elapsed)
+		if reachable then
+			return c.root, c.hum, dir, pitch
+		end
+		if not fbRoot then
+			fbRoot, fbHum, fbDir, fbPitch = c.root, c.hum, dir, pitch
+		end
+	end
+
+	return fbRoot, fbHum, fbDir, fbPitch
+end
+
+hbConn = RunService.Heartbeat:Connect(function()
+	local char = LocalPlayer.Character
+	if char then eachSurvivor(char, sampleTarget) end
+end)
+
+pcall(function() RunService:UnbindFromRenderStep(PRE_STEP) end)
+RunService:BindToRenderStep(PRE_STEP, Enum.RenderPriority.Character.Value, function()
+	savedCamCF = nil
+	if unloaded then return end
+	local char = LocalPlayer.Character
+	local myRoot = char and (char.PrimaryPart or char:FindFirstChild("HumanoidRootPart"))
+	if not (myRoot and char:GetAttribute("PursuitState") == "Charging") then
+		wasCharging, lockedRoot, lockedHum = false, nil, nil
+		return
+	end
+
+	if not wasCharging then
+		wasCharging, chargeStartAt, lockedRoot, lockedHum = true, os.clock(), nil, nil
+	end
+
+	local elapsed = os.clock() - chargeStartAt
+	local flatDir, camPitchDeg, reachable
+
+	if lockedRoot and lockedRoot.Parent and lockedHum and lockedHum.Health > 0 then
+		flatDir, camPitchDeg, reachable = solvePursuit(lockedRoot, myRoot, elapsed)
+	end
+	if not reachable then
+		local r, h, d, p = pickTarget(char, myRoot, elapsed)
+		if d then lockedRoot, lockedHum, flatDir, camPitchDeg = r, h, d, p end
+	end
+	if not flatDir then return end
+
+	local cam = Workspace.CurrentCamera
+	if not cam then return end
+
+	savedCamCF = cam.CFrame
+	local p = math.rad(camPitchDeg)
+	local look = (flatDir * math.cos(p) + Vector3.new(0, math.sin(p), 0)).Unit
+	cam.CFrame = CFrame.lookAt(savedCamCF.Position, savedCamCF.Position + look)
+end)
+
+pcall(function() RunService:UnbindFromRenderStep(POST_STEP) end)
+RunService:BindToRenderStep(POST_STEP, Enum.RenderPriority.Character.Value + 2, function()
+	if savedCamCF then
+		local cam = Workspace.CurrentCamera
+		if cam then cam.CFrame = savedCamCF end
+		savedCamCF = nil
+	end
+end)
+
+env.__G666_PURSUIT_UNLOAD = function()
+	if unloaded then return end
+	unloaded = true
+	wasCharging, lockedRoot, lockedHum, savedCamCF = false, nil, nil, nil
+	pcall(function() RunService:UnbindFromRenderStep(PRE_STEP) end)
+	pcall(function() RunService:UnbindFromRenderStep(POST_STEP) end)
+	if hbConn then pcall(function() hbConn:Disconnect() end) end
+	env.__G666_PURSUIT_UNLOAD = nil
+end
