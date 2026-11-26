@@ -3,6 +3,7 @@ if type(env.__G666_PURSUIT_UNLOAD) == "function" then pcall(env.__G666_PURSUIT_U
 
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
 local Workspace = game:GetService("Workspace")
 local Stats = game:GetService("Stats")
 
@@ -59,7 +60,9 @@ local motion = setmetatable({}, { __mode = "k" })
 local cachedPing, lastPingAt = 0.05, 0
 local lastFilterRef, lockedRoot, lockedHum, savedCamCF
 local wasCharging, chargeStartAt = false, 0
-local hbConn, unloaded = nil, false
+local enabled = true
+local conns = {}
+local gui, unloaded = nil, false
 
 local function updateWallFilter()
 	local ref = Workspace:FindFirstChild("Players") or LocalPlayer.Character
@@ -342,7 +345,85 @@ local function pickTarget(char, myRoot, elapsed)
 	return fbRoot, fbHum, fbDir, fbPitch
 end
 
-hbConn = RunService.Heartbeat:Connect(function()
+-- Botão flutuante compacto com deadzone inteligente (clique vs arraste)
+do
+	local parent = (typeof(gethui) == "function" and gethui()) or game:GetService("CoreGui")
+	gui = Instance.new("ScreenGui")
+	gui.Name = "__G666_PursuitToggle"
+	gui.ResetOnSpawn = false
+	gui.IgnoreGuiInset = true
+	gui.DisplayOrder = 50
+	gui.Parent = parent
+
+	local btn = Instance.new("TextButton")
+	btn.Size = UDim2.fromOffset(82, 30)
+	btn.Position = UDim2.new(0, 16, 0.5, -15)
+	btn.BackgroundColor3 = Color3.fromRGB(22, 22, 26)
+	btn.BackgroundTransparency = 0.15
+	btn.Font = Enum.Font.GothamBold
+	btn.TextSize = 12
+	btn.AutoButtonColor = false
+	btn.Parent = gui
+
+	Instance.new("UICorner", btn).CornerRadius = UDim.new(0, 8)
+	local stroke = Instance.new("UIStroke", btn)
+	stroke.Thickness = 1.5
+
+	local function refreshVisual()
+		btn.Text = enabled and "AIM: ON" or "AIM: OFF"
+		btn.TextColor3 = enabled and Color3.fromRGB(110, 255, 145) or Color3.fromRGB(255, 105, 105)
+		stroke.Color = enabled and Color3.fromRGB(70, 210, 110) or Color3.fromRGB(190, 65, 65)
+	end
+	refreshVisual()
+
+	local activeInput, startInputPos, startBtnPos, dragging = nil, nil, nil, false
+	local DRAG_THRESHOLD = 12
+
+	conns[#conns + 1] = btn.InputBegan:Connect(function(input)
+		if activeInput then return end
+		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+			activeInput = input
+			startInputPos = input.Position
+			startBtnPos = Vector2.new(btn.AbsolutePosition.X, btn.AbsolutePosition.Y)
+			dragging = false
+		end
+	end)
+
+	conns[#conns + 1] = UserInputService.InputChanged:Connect(function(input)
+		if not activeInput then return end
+		local isSameTouch = input == activeInput
+		local isMouseMove = activeInput.UserInputType == Enum.UserInputType.MouseButton1 and input.UserInputType == Enum.UserInputType.MouseMovement
+		if not (isSameTouch or isMouseMove) then return end
+
+		local dx = input.Position.X - startInputPos.X
+		local dy = input.Position.Y - startInputPos.Y
+		if not dragging and (dx * dx + dy * dy) >= (DRAG_THRESHOLD * DRAG_THRESHOLD) then
+			dragging = true
+		end
+		if dragging then
+			local cam = Workspace.CurrentCamera
+			local vp = cam and cam.ViewportSize or Vector2.new(1280, 720)
+			local nx = math.clamp(startBtnPos.X + dx, 4, vp.X - btn.AbsoluteSize.X - 4)
+			local ny = math.clamp(startBtnPos.Y + dy, 4, vp.Y - btn.AbsoluteSize.Y - 4)
+			btn.Position = UDim2.fromOffset(nx, ny)
+		end
+	end)
+
+	conns[#conns + 1] = UserInputService.InputEnded:Connect(function(input)
+		if input ~= activeInput then return end
+		if not dragging then
+			enabled = not enabled
+			if not enabled then
+				wasCharging, lockedRoot, lockedHum = false, nil, nil
+			end
+			refreshVisual()
+		end
+		activeInput, dragging = nil, false
+	end)
+end
+
+conns[#conns + 1] = RunService.Heartbeat:Connect(function()
+	if not enabled then return end
 	local char = LocalPlayer.Character
 	if char then eachSurvivor(char, sampleTarget) end
 end)
@@ -350,7 +431,10 @@ end)
 pcall(function() RunService:UnbindFromRenderStep(PRE_STEP) end)
 RunService:BindToRenderStep(PRE_STEP, Enum.RenderPriority.Character.Value, function()
 	savedCamCF = nil
-	if unloaded then return end
+	if unloaded or not enabled then
+		wasCharging, lockedRoot, lockedHum = false, nil, nil
+		return
+	end
 	local char = LocalPlayer.Character
 	local myRoot = char and (char.PrimaryPart or char:FindFirstChild("HumanoidRootPart"))
 	if not (myRoot and char:GetAttribute("PursuitState") == "Charging") then
@@ -398,6 +482,8 @@ env.__G666_PURSUIT_UNLOAD = function()
 	wasCharging, lockedRoot, lockedHum, savedCamCF = false, nil, nil, nil
 	pcall(function() RunService:UnbindFromRenderStep(PRE_STEP) end)
 	pcall(function() RunService:UnbindFromRenderStep(POST_STEP) end)
-	if hbConn then pcall(function() hbConn:Disconnect() end) end
+	for _, c in ipairs(conns) do pcall(function() c:Disconnect() end) end
+	table.clear(conns)
+	if gui then pcall(function() gui:Destroy() end) end
 	env.__G666_PURSUIT_UNLOAD = nil
 end
